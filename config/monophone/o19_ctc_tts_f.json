@@ -1,0 +1,151 @@
+{
+    "encoder": {
+        "model_path": "/mnt/workspace2/liuhw/ckpts/s2p_o19/best-10.pt",
+        "fbank_config": "/mnt/workspace2/liuhw/ctc_tts/config/fbank.conf", 
+        "phonetisaurus_model_path": "/mnt/workspace2/liuhw/ctc_tts/config/model.fst",
+        "kaldi_fbank_in": true,
+        "type": "ConformerNet",
+        "finetune_encoder": false,
+        "kwargs": {
+            "num_cells": 18,
+            "idim": 80,
+            "hdim": 512,
+            "conv": "vgg2l",
+            "num_heads": 8,
+            "d_head": 64,
+            "dropout": 0.3,
+            "dropout_attn": 0.3,
+            "kernel_size": 32,
+            "num_classes": 38,
+            "modernized_atten": true,
+            "with_head": true
+        },
+        "tokens_per_second": 25
+    },
+    "tokenizer": {
+        "type": "LexiconTokenizer",
+        "option-init": {
+            "lexicon": ""
+        },
+        "file": "/mnt/workspace2/liuhw/ctc_tts/config/tokenizer_updated.tknz",
+        "|V|": 38
+    },
+
+    "nac": {
+        "type": "wavtokenizer",
+        "nac_config": "/mnt/workspace2/liuhw/ctc_tts/WavTokenizer/configs/wavtokenizer_smalldata_frame75_3s_nq1_code4096_dim512_kmeans200_attn.yaml",
+        "nac_model": "/mnt/workspace2/liuhw/ckpts/wavtokenizer/wavtokenizer_large_speech_320_24k.ckpt", 
+        "SILENCE_TOKEN_ID": 453,
+        "codebook_size": 4096,
+        "tokens_per_second": 75
+    },
+
+    "data":{
+        "lexicon_path":"/mnt/workspace/liuhw/datasets/ctc_tts/mono_phone_librispeech/lexicon.txt",
+        "block_type": "biword",
+        "separators": {
+            " ": 4196,
+            ",": 4197,
+            ".": 4198,
+            "!": 4199,
+            "?": 4200
+        },
+        "unit_vocab_size": 100,
+        "unit_token_start": 4096,
+        "unit_token_end": 4195,
+        "separator_token_start": 4196,
+        "separator_token_end": 4200,
+        "eob": 4201,
+        "pad": 4202,
+        "eos": 4203,
+        "future_speech_token_num": 0,
+        "silence_num": 0,
+        "future_num": 1,
+        "keep_silence_num": 3,
+        "raw_train_path": "/mnt/workspace2/liuhw/datasets/ctc_tts/mono_phone_librispeech/raw/train.json",    
+        "raw_dev_path": "/mnt/workspace2/liuhw/datasets/ctc_tts/mono_phone_librispeech/raw/dev.json",
+        "raw_test_path": "/mnt/workspace2/liuhw/datasets/ctc_tts/mono_phone_librispeech/raw/test_clean.json",
+        "train_data": "/mnt/workspace2/liuhw/datasets/ctc_tts/mono_phone_librispeech/aligned_data/aligned_train.json",
+        "valid_data": "/mnt/workspace2/liuhw/datasets/ctc_tts/mono_phone_librispeech/aligned_data/aligned_dev.json",
+        "test_data": "/mnt/workspace2/liuhw/datasets/ctc_tts/mono_phone_librispeech/aligned_data/aligned_test.json",
+        "need_offset": true
+    },
+
+    "model": {
+        "model_type": "gpt2",
+        "block_size": 4096,
+        "vocab_size": 4204,
+        "n_layer": 12,
+        "n_head": 16,
+        "n_embd": 1024,
+        "dropout": 0.3,
+        "bias": false,
+        "is_train": true,
+
+        "length_aligned_input": true,
+        "text_embd_dim": 256,
+        "speech_embd_dim": 768,
+        "speech_vocab_size": 4096,
+        "text_vocab_size": 108,
+        "text_pad_token": 106,
+        "pad_token": 4202
+    },
+
+    "training": {
+        "batch_size": 8,
+        "gradient_accumulation_steps": 4,
+        "grad_clip": 1.0,
+        "max_iters": 320000,
+        "lr_schedule": "cosine",
+        "learning_rate": 3e-4,
+        "decay_lr": true,
+        "warmup_iters": 25000,
+        "lr_decay_iters": 320000,
+        "min_lr": 3e-6,
+        "weight_decay": 1e-1,
+        "beta1": 0.9,
+        "beta2": 0.95,
+        "eps": 1e-5,
+
+        "eval_interval": 4000,
+        "eval_iters": 160,
+        "eval_only": false,
+
+        "compile": true,
+        "device": "cuda:0",
+        "backend": "nccl",
+        "dtype": "bfloat16",
+        "init_from": "scratch"
+    },
+
+    "out": {
+        "out_dir": "/mnt/workspace2/liuhw/experiments/ctc_tts/mono_phone/m3_o19_ctc_tts_f",
+        "checkpoint_filename": "ckpt.pt",
+        "always_save_checkpoint": true,
+        "tensorboard_dir": "/mnt/workspace2/liuhw/experiments/ctc_tts/mono_phone/m3_o19_ctc_tts_f/tensorboard",
+        "log_interval": 1
+    },
+    "inference": {
+        "model_path": "/mnt/workspace2/liuhw/experiments/ctc_tts/mono_phone/m3_o19_ctc_tts_f/ckpt.pt",
+        "output_dir": "/mnt/workspace2/liuhw/experiments/ctc_tts/mono_phone/m3_o19_ctc_tts_f/test/topp09_ct",
+        "wavlm_path": "/mnt/workspace2/liuhw/ckpts/wavlm",
+        "asr_model_type": "conformer-transducer",
+        "asr_model_path": "/mnt/workspace2/liuhw/ckpts/conformer_transducer/stt_en_conformer_transducer_xlarge.nemo",
+        "continuation_data": "/mnt/workspace2/liuhw/datasets/ctc_tts/mono_phone_librispeech/raw/test_clean.json",
+        "cross_data": "/mnt/workspace2/liuhw/datasets/ctc_tts/mono_phone_librispeech/raw/seedtts_cross_text.json",
+        "task_type": "all",
+        "sampling_strategy": "topp",
+        "p": 0.9,
+        "max_dump_size": 1280,
+        "sample_rate": 24000,
+        "tts_device_1": "0",
+        "tts_device_2": "1",
+        "initial_dump_size_1": 40,
+        "initial_dump_size_2": 160,
+        "enable_chunked_decode": true,
+        "enable_smoothing": false,
+        "overlap_token_count": 0,
+        "smoothing_ms": 0,
+        "smoothing_window": "equal_power"
+    }
+}

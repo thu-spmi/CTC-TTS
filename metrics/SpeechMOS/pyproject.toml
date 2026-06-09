@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "speechmos"
+version = "1.2.0"
+description = "Easy-to-Use Speech MOS predictors 🎧"
+authors = ["tarepan"]
+readme = "README.md"
+repository = "https://github.com/tarepan/SpeechMOS"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+## Poetry is not good for version control of PyTorch (it has many many variants for a version, so poetry become confused)
+## torch = "2.0.0"
+## torchaudio = "2.0.1"
+
+[tool.poetry.dev-dependencies]
+pytest = "7.*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pylint.messages_control]
+disable = [
+  # This is opinionated
+  "line-too-long",
+  "pointless-string-statement",
+  "no-member",
+]
