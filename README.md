@@ -3,8 +3,10 @@
 Official implementation of the Interspeech 2026 paper:
 `CTC-TTS: LLM-Based Dual-Streaming Text-to-Speech with CTC Alignment`
 
-- Paper: [arXiv PDF](https://arxiv.org/pdf/2602.19574)
-- Demo samples: [Project page](https://ctctts.github.io/)
+[![arXiv](https://img.shields.io/badge/arXiv-2602.19574-b31b1b.svg)](https://arxiv.org/pdf/2602.19574)
+[![Interspeech 2026](https://img.shields.io/badge/Conference-Interspeech%202026-blue.svg)]()
+[![Hugging Face](https://img.shields.io/badge/🤗%20HuggingFace-CTC--TTS-ffd21e.svg)](https://huggingface.co/cri6/CTC-TTS)
+[![Demo Page](https://img.shields.io/badge/Demo-Samples-green.svg)](https://ctctts.github.io/)
 
 ## Overview
 
