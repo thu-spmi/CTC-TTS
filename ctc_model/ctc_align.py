@@ -21,6 +21,8 @@ class TextTokenizationResult:
     segment_lengths:
         Number of tokens produced for each text segment.
         If spaces are also treated as separators, one segment usually corresponds to one word-level unit sequence.
+    segments:
+        Text string of each segment, aligned one-to-one with `segment_lengths`.
     separators:
         Separator after each text segment. If the final segment has no trailing separator, it does not appear in this list.
     separator_token_ids:
@@ -31,6 +33,7 @@ class TextTokenizationResult:
     shifted_token_ids: List[int]
     shifted_token_ids_with_separators: List[int]
     segment_lengths: List[int]
+    segments: List[str]
     separators: List[str]
     separator_token_ids: List[int]
 
@@ -290,6 +293,7 @@ def encode_text_with_separators(text: str, tokenizer, config: Dict) -> TextToken
         shifted_token_ids=shifted_token_ids,
         shifted_token_ids_with_separators=shifted_token_ids_with_separators,
         segment_lengths=segment_lengths,
+        segments=list(segments),
         separators=separators,
         separator_token_ids=separator_token_ids,
     )
@@ -886,6 +890,187 @@ def align_text_logits_and_speech_tokens(
     )
 
 
+def _format_textgrid_time(value: float) -> str:
+    """
+    Format a timestamp for TextGrid output.
+
+    Args:
+        value:
+            Timestamp in seconds.
+
+    Returns:
+        str:
+            Fixed-precision decimal string.
+    """
+
+    return f"{float(value):.6f}"
+
+
+def _escape_textgrid_text(text: str) -> str:
+    """
+    Escape a string so it can be safely embedded in a TextGrid `text = "..."` field.
+
+    Args:
+        text:
+            Raw text.
+
+    Returns:
+        str:
+            Text with backslashes and double quotes escaped.
+    """
+
+    return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _render_textgrid_tier(
+    name: str,
+    intervals: Sequence[Tuple[float, float, str]],
+    xmin: float,
+    xmax: float,
+    item_index: int,
+) -> List[str]:
+    """
+    Render one IntervalTier into TextGrid long-format lines.
+
+    Args:
+        name:
+            Tier name.
+        intervals:
+            Interval list, each element is `(start_seconds, end_seconds, text)`.
+        xmin:
+            Tier start time.
+        xmax:
+            Tier end time.
+        item_index:
+            1-based tier index.
+
+    Returns:
+        List[str]:
+            TextGrid lines of this tier.
+    """
+
+    lines = [
+        f"    item [{item_index}]:",
+        '        class = "IntervalTier"',
+        f'        name = "{_escape_textgrid_text(name)}"',
+        f"        xmin = {_format_textgrid_time(xmin)}",
+        f"        xmax = {_format_textgrid_time(xmax)}",
+        f"        intervals: size = {len(intervals)}",
+    ]
+    for index, (start, end, text) in enumerate(intervals, start=1):
+        lines.extend(
+            [
+                f"        intervals [{index}]:",
+                f"            xmin = {_format_textgrid_time(start)}",
+                f"            xmax = {_format_textgrid_time(end)}",
+                f'            text = "{_escape_textgrid_text(text)}"',
+            ]
+        )
+    return lines
+
+
+def build_textgrid(
+    alignment_result: CTCTextSpeechAlignmentResult,
+    tokenizer,
+    config: Dict,
+    audio_duration: Optional[float] = None,
+) -> str:
+    """
+    Render a CTC alignment result into Praat TextGrid (long) text.
+
+    Two IntervalTiers are produced:
+    - `words`: word-level intervals, grouped by `tokenization.segments`;
+    - `phones`: unit-level intervals, one per text token (phoneme).
+
+    Timestamps are derived from the speech-token timeline:
+    `seconds = speech_token_index / config["nac"]["tokens_per_second"]`.
+
+    Note that separators (punctuation) do not occupy speech tokens, so they never
+    appear as standalone intervals; adjacent words are directly contiguous.
+
+    Args:
+        alignment_result:
+            Result returned by `align_text_logits_and_speech_tokens`.
+        tokenizer:
+            Text tokenizer providing `dump_vocab() -> Dict[int, str]` for phoneme symbols.
+        config:
+            Global config dictionary. It must provide `nac.tokens_per_second`.
+        audio_duration:
+            Real audio duration in seconds, used as `xmax`.
+            When it is `None` or shorter than the aligned duration, `xmax` falls back to
+            the aligned duration; when it is longer, a trailing empty interval is appended
+            to both tiers so that they keep covering `[xmin, xmax]`.
+
+    Returns:
+        str:
+            TextGrid file content.
+    """
+
+    token_alignments = alignment_result.token_alignments
+    tokenization = alignment_result.tokenization
+    if not token_alignments:
+        raise ValueError("alignment_result.token_alignments must not be empty.")
+    if len(tokenization.segments) != len(tokenization.segment_lengths):
+        raise ValueError("tokenization.segments and tokenization.segment_lengths must have the same length.")
+
+    nac_tokens_per_second = config.get("nac", {}).get("tokens_per_second")
+    if not nac_tokens_per_second or nac_tokens_per_second <= 0:
+        raise KeyError("config['nac']['tokens_per_second'] is required and must be positive.")
+    nac_tokens_per_second = float(nac_tokens_per_second)
+
+    aligned_duration = float(token_alignments[-1].speech_end) / nac_tokens_per_second
+    if audio_duration is None or float(audio_duration) < aligned_duration:
+        xmax = aligned_duration
+    else:
+        xmax = float(audio_duration)
+    xmin = 0.0
+
+    vocab = tokenizer.dump_vocab()
+
+    phone_intervals: List[Tuple[float, float, str]] = []
+    for alignment in token_alignments:
+        phone_intervals.append(
+            (
+                alignment.speech_start / nac_tokens_per_second,
+                alignment.speech_end / nac_tokens_per_second,
+                vocab[int(alignment.ctc_token_id)],
+            )
+        )
+
+    word_intervals: List[Tuple[float, float, str]] = []
+    cursor = 0
+    for segment, segment_length in zip(tokenization.segments, tokenization.segment_lengths):
+        group = token_alignments[cursor:cursor + int(segment_length)]
+        cursor += int(segment_length)
+        if not group:
+            continue
+        word_intervals.append(
+            (
+                group[0].speech_start / nac_tokens_per_second,
+                group[-1].speech_end / nac_tokens_per_second,
+                segment,
+            )
+        )
+
+    if xmax > aligned_duration:
+        word_intervals.append((aligned_duration, xmax, ""))
+        phone_intervals.append((aligned_duration, xmax, ""))
+
+    lines = [
+        'File type = "ooTextFile"',
+        'Object class = "TextGrid"',
+        "",
+        f"xmin = {_format_textgrid_time(xmin)}",
+        f"xmax = {_format_textgrid_time(xmax)}",
+        "tiers? <exists>",
+        "size = 2",
+        "item []:",
+    ]
+    lines.extend(_render_textgrid_tier("words", word_intervals, xmin, xmax, 1))
+    lines.extend(_render_textgrid_tier("phones", phone_intervals, xmin, xmax, 2))
+    return "\n".join(lines) + "\n"
+
+
 class _DummyTokenizer:
     """
     Minimal tokenizer used by module-local self-tests.
@@ -909,6 +1094,17 @@ class _DummyTokenizer:
 
         normalized = text.replace(" ", "")
         return [self.mapping[ch] for ch in normalized]
+
+    def dump_vocab(self) -> Dict[int, str]:
+        """
+        Return the ID -> symbol mapping, used by TextGrid rendering in self-tests.
+
+        Returns:
+            Dict[int, str]:
+                Mapping from character ID back to its character.
+        """
+
+        return {index: symbol for symbol, index in self.mapping.items()}
 
 
 def _test_split_and_encode_text():
@@ -1061,6 +1257,7 @@ def _test_mid_sentence_sentence_end_separator_has_no_future_or_eos():
         shifted_token_ids=[4097, 4098, 4099, 4100],
         shifted_token_ids_with_separators=[4097, 4098, 4198, 4099, 4100, 4198],
         segment_lengths=[2, 2],
+        segments=["ab", "cd"],
         separators=[".", "."],
         separator_token_ids=[4198, 4198],
     )
@@ -1078,6 +1275,65 @@ def _test_mid_sentence_sentence_end_separator_has_no_future_or_eos():
     ]
 
 
+def _test_build_textgrid():
+    """
+    Minimal self-test for TextGrid rendering.
+
+    Returns:
+        None:
+            Validated only through `assert` statements and returns no value.
+    """
+
+    config = {
+        "encoder": {"tokens_per_second": 2},
+        "nac": {"codebook_size": 4096, "tokens_per_second": 4},
+        "data": {
+            "separators": {" ": 4196, ",": 4197, ".": 4198, "!": 4199, "?": 4200},
+            "eob": 4201,
+            "eos": 4202,
+        },
+    }
+    tokenizer = _DummyTokenizer({"a": 1, "b": 2, "c": 3})
+
+    logits = torch.full((1, 6, 4), -8.0)
+    logits[0, 0, 1] = 8.0
+    logits[0, 1, 1] = 8.0
+    logits[0, 2, 0] = 8.0
+    logits[0, 3, 2] = 8.0
+    logits[0, 4, 3] = 8.0
+    logits[0, 5, 0] = 8.0
+
+    result = align_text_logits_and_speech_tokens(
+        text="ab c.",
+        logits=logits,
+        tokenizer=tokenizer,
+        speech_token_ids=list(range(10)),
+        config=config,
+        blank_id=0,
+    )
+
+    # phones: a=[0,4), b=[4,8), c=[8,10) on a 4 tokens/second timeline -> 2.5s in total.
+    textgrid = build_textgrid(result, tokenizer, config, audio_duration=None)
+    assert textgrid.startswith('File type = "ooTextFile"')
+    assert 'class = "TextGrid"' in textgrid
+    assert "size = 2" in textgrid
+    assert 'name = "words"' in textgrid
+    assert 'name = "phones"' in textgrid
+    assert "xmax = 2.500000" in textgrid
+    assert "intervals: size = 2" in textgrid
+    assert "intervals: size = 3" in textgrid
+    assert textgrid.count('text = "a"') == 1
+    assert textgrid.count('text = "ab"') == 1
+    assert textgrid.count('text = ""') == 0
+
+    # A longer real audio duration appends one trailing empty interval per tier.
+    textgrid_padded = build_textgrid(result, tokenizer, config, audio_duration=3.0)
+    assert "xmax = 3.000000" in textgrid_padded
+    assert "intervals: size = 3" in textgrid_padded
+    assert "intervals: size = 4" in textgrid_padded
+    assert textgrid_padded.count('text = ""') == 2
+
+
 def run_module_tests():
     """
     Run all built-in minimal self-tests for this module.
@@ -1092,6 +1348,7 @@ def run_module_tests():
     _test_align_text_tokens_to_speech_tokens()
     _test_end_to_end_alignment()
     _test_mid_sentence_sentence_end_separator_has_no_future_or_eos()
+    _test_build_textgrid()
     print("ctc_align.py tests passed")
 
 

@@ -1,7 +1,7 @@
-export CUDA_VISIBLE_DEVICES="8"
+export CUDA_VISIBLE_DEVICES="4,5,6,7"
 gpu_nums=4
 # Remember to update the experiment directory path in the config file
-config_path=/mnt/workspace2/liuhw/experiments/ctc_tts/mono_phone/m3_o19_ctc_tts_f/m3_o19_ctc_tts_f.json
+config_path=/mnt/workspace/liuhw/ctc_tts/config/monophone/single-speaker/o21_single_speaker_ctc_tts_l.json
 START_STAGE=-1
 STOP_STAGE=-1
 
@@ -62,7 +62,7 @@ if (( START_STAGE <= 4 && STOP_STAGE >= 4 )); then
   # Multi-speaker cross and continuation tests
   python test/test_multi_speaker.py --config $config_path
 
-  # Streaming cross test
+  # Streaming cross and single-speaker tests
   # python test/test_streaming_inferencer.py --config $config_path
 
 fi

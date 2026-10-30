@@ -72,6 +72,16 @@ def _normalize_state_dict(path_or_checkpoint: CheckpointLike) -> OrderedDict:
 def extract_encoder_state_dict(path_or_checkpoint: CheckpointLike) -> OrderedDict:
     state_dict = _normalize_state_dict(path_or_checkpoint)
 
+    # Encoder weights from an external s2p pretrained checkpoint carry an "s2p_model." prefix
+    # (the same file may also contain p2g_model. / projector.);
+    # keep only the s2p_model.* entries and strip the prefix.
+    if any(key.startswith("s2p_model.") for key in state_dict):
+        return OrderedDict(
+            (key[len("s2p_model.") :], value)
+            for key, value in state_dict.items()
+            if key.startswith("s2p_model.")
+        )
+
     if any(key.startswith("encoder.") for key in state_dict):
         return OrderedDict(
             (key[len("encoder.") :], value)

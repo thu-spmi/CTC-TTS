@@ -7,7 +7,7 @@ from tqdm import tqdm
 import sys
 import json
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model_path = "/mnt/workspace2/liuhw/ckpts/utmos/utmos22_strong_step7459_v1.pt"
+model_path = "/mnt/workspace/liuhw/streaming_tts/metrics/utmos22_strong_step7459_v1.pt"
 predictor = None
 
 

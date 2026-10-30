@@ -449,11 +449,79 @@ class SentencePieceTokenizer(AbsTokenizer):
             **options,
         )
 
+class PretrainedTokenizer(AbsTokenizer):
+    """Pretrained tokenizer from huggingface.
+
+    https://huggingface.co/models
+    """
+
+    def __init__(self, T_cls: str, pretrained: str, **kwargs) -> None:
+        """
+        T_cls (str) : type of tokenizer class, e.g. 'BertTokenizer', 'Qwen2Tokenizer'.
+        pretrained_model (str) : name of pretrained model (available from huggingface)
+        kwargs : additional parameters for the tokenizer initialization.
+        """
+        super().__init__()
+
+        assert isinstance(T_cls, str) and T_cls.isidentifier()
+        import transformers
+        self.tokenizer = getattr(transformers, T_cls).from_pretrained(pretrained, **kwargs)
+
+    def __call__(self, *args, **kwds):
+        return self.tokenizer(*args, **kwds)
+    
+    def __getattr__(self, name):
+        if hasattr(self.tokenizer, name):
+            attr = getattr(self.tokenizer, name)
+            if callable(attr):
+                def wrapper(*args, **kwargs):
+                    return attr(*args, **kwargs)
+                return wrapper
+            return attr
+        raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
+    
+    @property
+    def vocab_size(self) -> int:
+        return len(self.tokenizer)
+
+    @property
+    def eos_token_id(self) -> int:
+        return self.tokenizer.eos_token_id
+
+    @property
+    def pad_token_id(self) -> int:
+        return self.tokenizer.pad_token_id
+    
+    @property
+    def padding_side(self) -> int:
+        return self.tokenizer.padding_side
+    
+    @padding_side.setter
+    def padding_side(self, value) -> int:
+        self.tokenizer.padding_side = value
+
+    def state_dict(self) -> OrderedDict:
+        x = pickle.dumps(self.tokenizer)
+        return OrderedDict({"tokenizer": pickle.dumps(self.tokenizer)})
+
+    def load_state_dict(self, state: OrderedDict):
+        self.tokenizer = pickle.loads(state["tokenizer"])
+
+    def encode(
+        self, strings: Union[str, Iterable[str]], **kwargs
+    ) -> Union[List[int], List[List[int]]]:
+        return self.tokenizer.encode(strings, **kwargs)
+
+    def decode(
+        self, indices: Union[Iterable[int], Iterable[Iterable[int]]], **kwargs
+    ) -> Union[str, Iterable[str]]:
+        return self.tokenizer.decode(indices, **kwargs)
 
 TOKENIZER_REGISTRY = {
     "SimpleTokenizer": SimpleTokenizer,
     "LexiconTokenizer": LexiconTokenizer,
     "SentencePieceTokenizer": SentencePieceTokenizer,
+    "PretrainedTokenizer": PretrainedTokenizer,
 }
 
 class _CompatTokenizerUnpickler(pickle.Unpickler):
@@ -465,6 +533,7 @@ class _CompatTokenizerUnpickler(pickle.Unpickler):
         ("cat.shared.tokenizer", "SimpleTokenizer"): SimpleTokenizer,
         ("cat.shared.tokenizer", "LexiconTokenizer"): LexiconTokenizer,
         ("cat.shared.tokenizer", "SentencePieceTokenizer"): SentencePieceTokenizer,
+        ("cat.shared.tokenizer", "PretrainedTokenizer"): PretrainedTokenizer,
     }
 
     def find_class(self, module: str, name: str):

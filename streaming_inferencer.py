@@ -42,6 +42,18 @@ worker_process_1 = None
 worker_process_2 = None
 worker_config_signature = None
 
+# GPU memory usage reported by the worker (in bytes). Each worker samples its own device with
+# torch.cuda.mem_get_info and writes the result into a multiprocessing.Value shared variable;
+# None means no worker is currently available, and a value < 0 means it has not been sampled yet.
+worker_mem_used_1 = None
+worker_mem_total_1 = None
+worker_mem_used_2 = None
+worker_mem_total_2 = None
+
+# Restart the worker processes when a single GPU's memory usage ratio (used/total) exceeds this
+# threshold; set to None or <=0 to disable the mechanism.
+DEFAULT_MEMORY_RESTART_THRESHOLD = 0.9
+
 
 @dataclass
 class StreamingDecoderState:
@@ -492,6 +504,20 @@ def _run_decoder_request(
         control_queue.put((request_id, "done", index))
 
 
+def _report_gpu_memory(mem_used, mem_total):
+    """Sample this GPU's memory usage inside the worker and write it to the shared variables,
+    so the main process can decide whether to restart the worker."""
+    if mem_used is None or mem_total is None:
+        return
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except Exception as exc:
+        print(f"[Worker] Failed to sample GPU memory usage: {exc}")
+        return
+    mem_used.value = float(total_bytes - free_bytes)
+    mem_total.value = float(total_bytes)
+
+
 def _decoder_worker_process(
     index: int,
     cfg: dict,
@@ -499,9 +525,13 @@ def _decoder_worker_process(
     request_queue,
     audio_output_queue,
     control_queue,
+    mem_used=None,
+    mem_total=None,
 ):
     prompt_init_cache = {}
     model_handler = ModelHandler(cfg, device_id=device_id)
+    # Record the baseline memory usage after the model has been loaded
+    _report_gpu_memory(mem_used, mem_total)
     while True:
         request = request_queue.get()
         if request is None:
@@ -524,6 +554,12 @@ def _decoder_worker_process(
             speech_prompt=request.get("speech_prompt"),
             text_prompt=request.get("text_prompt"),
         )
+        # With process reuse, the prompt-init cache (including kvcache clones) would accumulate
+        # across samples, so clear it at the end of every request; this keeps only the reuse benefit
+        # within a single request (multiple sentences sharing the same prompt) and avoids
+        # monotonically growing memory usage across samples.
+        prompt_init_cache.clear()
+        _report_gpu_memory(mem_used, mem_total)
 
 
 async def audio_generator_async(
@@ -545,6 +581,7 @@ async def audio_generator_async(
     tail = None
     wav_buf = []
     seen_done = set()
+    errored = False
     wrote_wav = False
 
     def finalize_wav():
@@ -575,6 +612,7 @@ async def audio_generator_async(
             if event_request_id == request_id:
                 if message_type == "error":
                     print(f"Error in multiprocess streaming worker: {payload}")
+                    errored = True
                     continue
 
                 if message_type == "done":
@@ -584,7 +622,17 @@ async def audio_generator_async(
             try:
                 event_request_id, message_type, payload = current_queue.get_nowait()
             except Empty:
-                if len(seen_done) == len(processes):
+                # Normal completion is signaled by the worker owning the last sentence sending "end"
+                # on its own output queue (the same queue as the audio, so FIFO ordering is preserved).
+                # "done" goes through the shared control queue, while audio/switch/end go through the
+                # per-worker output queues, and there is no ordering guarantee across queues: a large
+                # audio chunk can fill the output queue's pipe while its feeder thread is still writing,
+                # yet the "done" in the control queue is already readable. If we finished based on "done"
+                # alone here, we would drop the not-yet-drained tail audio (with chunked decoding a single
+                # chunk can reach max_dump_size≈1280 tokens), showing up as "the last little segment was
+                # never synthesized". Therefore we only allow "done" as a fallback ending when a worker
+                # error was actually received.
+                if errored and len(seen_done) == len(processes):
                     finalize_wav()
                     yield None
                     break
@@ -671,6 +719,7 @@ def _shutdown_worker_processes():
     global worker_request_queue_1, worker_request_queue_2
     global worker_output_queue_1, worker_output_queue_2, worker_control_queue
     global worker_config_signature
+    global worker_mem_used_1, worker_mem_total_1, worker_mem_used_2, worker_mem_total_2
 
     for request_queue in (worker_request_queue_1, worker_request_queue_2):
         if request_queue is not None:
@@ -695,6 +744,75 @@ def _shutdown_worker_processes():
     worker_output_queue_2 = None
     worker_control_queue = None
     worker_config_signature = None
+    worker_mem_used_1 = None
+    worker_mem_total_1 = None
+    worker_mem_used_2 = None
+    worker_mem_total_2 = None
+
+
+def shutdown_workers():
+    """Explicitly shut down the reused worker processes (e.g. called by the test script after all samples finish)."""
+    _shutdown_worker_processes()
+
+
+def _read_worker_memory(index: int):
+    """Read the most recently reported memory usage of the given worker, returning
+    (used_bytes, total_bytes); returns (None, None) when unavailable."""
+    used_value, total_value = (
+        (worker_mem_used_1, worker_mem_total_1) if index == 0 else (worker_mem_used_2, worker_mem_total_2)
+    )
+    if used_value is None or total_value is None:
+        return None, None
+    used_bytes = float(used_value.value)
+    total_bytes = float(total_value.value)
+    if used_bytes < 0 or total_bytes <= 0:
+        return None, None
+    return used_bytes, total_bytes
+
+
+def _memory_restart_threshold(cfg: dict):
+    """Read the memory-restart threshold; returning None means the mechanism is disabled."""
+    threshold = cfg.get("inference", {}).get("memory_restart_threshold", DEFAULT_MEMORY_RESTART_THRESHOLD)
+    if threshold is None:
+        return None
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        return None
+    if threshold <= 0 or threshold > 1:
+        return None
+    return threshold
+
+
+def _maybe_restart_workers(cfg: dict) -> bool:
+    """Restart all worker processes when the memory usage ratio of any worker's GPU exceeds the threshold."""
+    threshold = _memory_restart_threshold(cfg)
+    if threshold is None:
+        return False
+    if worker_process_1 is None or worker_process_2 is None:
+        return False
+    if not (worker_process_1.is_alive() and worker_process_2.is_alive()):
+        return False
+
+    exceeded = []
+    for index in (0, 1):
+        used_bytes, total_bytes = _read_worker_memory(index)
+        if used_bytes is None:
+            continue
+        ratio = used_bytes / total_bytes
+        if ratio > threshold:
+            exceeded.append((index, used_bytes, total_bytes, ratio))
+    if not exceeded:
+        return False
+
+    detail = ", ".join(
+        f"worker{index}(used/total={used_bytes / 1024 ** 3:.2f}/{total_bytes / 1024 ** 3:.2f} GiB, "
+        f"{ratio * 100.0:.1f}%)"
+        for index, used_bytes, total_bytes, ratio in exceeded
+    )
+    print(f"[Worker] GPU memory usage exceeds {threshold * 100.0:.1f}%, restarting worker processes: {detail}")
+    _shutdown_worker_processes()
+    return True
 
 
 def init_models(force_restart: bool = False):
@@ -703,6 +821,7 @@ def init_models(force_restart: bool = False):
     global mp_ctx, worker_request_queue_1, worker_request_queue_2
     global worker_output_queue_1, worker_output_queue_2, worker_control_queue
     global worker_process_1, worker_process_2, worker_config_signature
+    global worker_mem_used_1, worker_mem_total_1, worker_mem_used_2, worker_mem_total_2
 
     if text_streamer is None:
         text_streamer = FixedTextStreamer()
@@ -732,14 +851,39 @@ def init_models(force_restart: bool = False):
     device_id_1 = config["inference"]["tts_device_1"]
     device_id_2 = config["inference"]["tts_device_2"]
 
+    # Memory usage is sampled by the worker itself and written into shared variables, so the main
+    # process can decide whether to restart without needing a CUDA context
+    worker_mem_used_1 = mp_ctx.Value("d", -1.0)
+    worker_mem_total_1 = mp_ctx.Value("d", -1.0)
+    worker_mem_used_2 = mp_ctx.Value("d", -1.0)
+    worker_mem_total_2 = mp_ctx.Value("d", -1.0)
+
     worker_process_1 = mp_ctx.Process(
         target=_decoder_worker_process,
-        args=(0, config, device_id_1, worker_request_queue_1, worker_output_queue_1, worker_control_queue),
+        args=(
+            0,
+            config,
+            device_id_1,
+            worker_request_queue_1,
+            worker_output_queue_1,
+            worker_control_queue,
+            worker_mem_used_1,
+            worker_mem_total_1,
+        ),
         daemon=True,
     )
     worker_process_2 = mp_ctx.Process(
         target=_decoder_worker_process,
-        args=(1, config, device_id_2, worker_request_queue_2, worker_output_queue_2, worker_control_queue),
+        args=(
+            1,
+            config,
+            device_id_2,
+            worker_request_queue_2,
+            worker_output_queue_2,
+            worker_control_queue,
+            worker_mem_used_2,
+            worker_mem_total_2,
+        ),
         daemon=True,
     )
     worker_process_1.start()
@@ -769,7 +913,11 @@ async def tts(
     globals()["cross_first_chunk_history_text_token_count"] = None
     globals()["cross_first_chunk_history_text_update_time_ms"] = None
 
-    init_models(force_restart=True)
+    # Reuse the already-started worker processes (avoiding reloading the model for every sample);
+    # if the memory usage reported by the previous request exceeded the threshold, restart the
+    # workers first.
+    _maybe_restart_workers(config)
+    init_models(force_restart=False)
 
     request_id = uuid.uuid4().hex
     request_payload = {
@@ -785,19 +933,16 @@ async def tts(
     processes = [worker_process_1, worker_process_2]
 
     async def _gen():
-        try:
-            async for item in audio_generator_async(
-                worker_output_queue_1,
-                worker_output_queue_2,
-                worker_control_queue,
-                request_id,
-                wav_path,
-                processes,
-                enable_smoothing=enable_smoothing,
-            ):
-                yield item
-        finally:
-            _shutdown_worker_processes()
+        async for item in audio_generator_async(
+            worker_output_queue_1,
+            worker_output_queue_2,
+            worker_control_queue,
+            request_id,
+            wav_path,
+            processes,
+            enable_smoothing=enable_smoothing,
+        ):
+            yield item
 
     return _gen()
 

@@ -7,17 +7,30 @@ import time
 import multiprocessing as mp
 import math
 import argparse
+import soundfile as sf
 from typing import List
 
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
 
 from src.nac import build_nac
-from ctc_model.ctc_align import align_text_logits_and_speech_tokens
+from ctc_model.ctc_align import align_text_logits_and_speech_tokens, build_textgrid
 from ctc_model.encoder_loader import infer_ctc_logits, load_pretrained_encoder
 from ctc_model.tokenizer import load_tknz
 
 PROCESSES_PER_GPU = 4  # Processes per GPU
+
+# When --write_textgrid is enabled, the TextGrid path is derived from the audio path by a direct
+# string replacement: replace the --audio_root prefix with --textgrid_dir and change the extension to .TextGrid
+DEFAULT_AUDIO_ROOT = "/mnt/workspace/liuhw/datasets/librispeech/LibriSpeech"
+DEFAULT_TEXTGRID_DIR = "/mnt/workspace/liuhw/datasets/librispeech/LibriSpeech/textgrid"
+
+
+def build_textgrid_file_path(textgrid_dir, audio_path, audio_root=DEFAULT_AUDIO_ROOT):
+    """Convert an audio path into a TextGrid path by string replacement: swap the root prefix and change the extension."""
+    replaced = audio_path.replace(audio_root, textgrid_dir, 1)
+    return os.path.splitext(replaced)[0] + ".TextGrid"
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Multiprocess data preparation")
@@ -33,6 +46,23 @@ def parse_args():
         type=str,
         default=default_device,
         help="Device to run on (e.g., 'cuda', 'cpu', or 'cuda:0')"
+    )
+    parser.add_argument(
+        "--write_textgrid",
+        action="store_true",
+        help="Additionally write a .TextGrid for each audio (words + phones tiers)"
+    )
+    parser.add_argument(
+        "--textgrid_dir",
+        type=str,
+        default=DEFAULT_TEXTGRID_DIR,
+        help="Root directory for TextGrid output; the relative path is appended after replacing the --audio_root prefix"
+    )
+    parser.add_argument(
+        "--audio_root",
+        type=str,
+        default=DEFAULT_AUDIO_ROOT,
+        help="Root prefix of the original audio; replaced with --textgrid_dir when writing TextGrid"
     )
     return parser.parse_args()
 
@@ -71,7 +101,8 @@ def format_units_text(tokenizer, tokenization) -> str:
     return " ".join(units_parts)
 
 
-def process_worker(proc_id, data_subset, config, output_path, dataset_name, progress_counter, requested_device):
+def process_worker(proc_id, data_subset, config, output_path, dataset_name, progress_counter, requested_device,
+                   write_textgrid=False, textgrid_dir=DEFAULT_TEXTGRID_DIR, audio_root=DEFAULT_AUDIO_ROOT):
     """Multiprocessing worker function"""
     device = resolve_worker_device(proc_id, requested_device)
     if device.startswith("cuda:"):
@@ -88,6 +119,8 @@ def process_worker(proc_id, data_subset, config, output_path, dataset_name, prog
 
         processed_data = []
         error_count = 0
+        textgrid_error_count = 0
+        created_textgrid_dirs = set()
         
         for item in data_subset:
             audio_path = os.path.join(item['speech_folder'], item['speech_file'])
@@ -113,6 +146,22 @@ def process_worker(proc_id, data_subset, config, output_path, dataset_name, prog
                 seqs_str = ' '.join(map(str, alignment_result.seqs_sequence))
                 units_str = format_units_text(tokenizer, alignment_result.tokenization)
 
+                if write_textgrid:
+                    try:
+                        duration = sf.info(audio_path).duration
+                        textgrid = build_textgrid(alignment_result, tokenizer, config, audio_duration=duration)
+                        textgrid_path = build_textgrid_file_path(textgrid_dir, audio_path, audio_root)
+                        textgrid_subdir = os.path.dirname(textgrid_path)
+                        if textgrid_subdir not in created_textgrid_dirs:
+                            os.makedirs(textgrid_subdir, exist_ok=True)
+                            created_textgrid_dirs.add(textgrid_subdir)
+                        with open(textgrid_path, 'w', encoding='utf-8') as f:
+                            f.write(textgrid)
+                    except Exception as e:
+                        textgrid_error_count += 1
+                        if textgrid_error_count <= 5:
+                            print(f"Process {proc_id} failed to write TextGrid {audio_id}: {str(e)}")
+
                 data_item = {
                     "id": audio_id,
                     "audio_path": audio_path,
@@ -133,14 +182,16 @@ def process_worker(proc_id, data_subset, config, output_path, dataset_name, prog
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(processed_data, f, ensure_ascii=False, indent=2)
         
-        print(f"Process {proc_id} completed: {len(processed_data)} processed, {error_count} errors")
+        print(f"Process {proc_id} completed: {len(processed_data)} processed, {error_count} errors, {textgrid_error_count} textgrid errors")
         
     except Exception as e:
         print(f"Process {proc_id} fatal error: {e}")
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump([], f)
 
-def process_dataset_multiprocess(data_list, config, output_file, dataset_name, device):
+def process_dataset_multiprocess(data_list, config, output_file, dataset_name, device,
+                                 write_textgrid=False, textgrid_dir=DEFAULT_TEXTGRID_DIR,
+                                 audio_root=DEFAULT_AUDIO_ROOT):
     """Process the dataset with multiple processes"""
     if not data_list:
         print(f"No data to process for {dataset_name}")
@@ -165,7 +216,8 @@ def process_dataset_multiprocess(data_list, config, output_file, dataset_name, d
         part_output_path = output_file.replace(".json", f"_part{i}.json")
         p = mp.Process(
             target=process_worker,
-            args=(i, chunk, config, part_output_path, dataset_name, progress_counter, device),
+            args=(i, chunk, config, part_output_path, dataset_name, progress_counter, device,
+                  write_textgrid, textgrid_dir, audio_root),
         )
         processes.append((p, part_output_path))
         p.start()
@@ -203,7 +255,8 @@ def process_dataset_multiprocess(data_list, config, output_file, dataset_name, d
     
     print(f"{dataset_name} processing completed: {len(all_results)} items saved to {output_file}")
 
-def main(config_path, device="cuda" if torch.cuda.is_available() else "cpu"):
+def main(config_path, device="cuda" if torch.cuda.is_available() else "cpu",
+         write_textgrid=False, textgrid_dir=DEFAULT_TEXTGRID_DIR, audio_root=DEFAULT_AUDIO_ROOT):
     config = json.load(open(config_path))
 
     train_data = json.load(open(config['data']['raw_train_path']))
@@ -213,6 +266,8 @@ def main(config_path, device="cuda" if torch.cuda.is_available() else "cpu"):
     print(f"Raw train data length: {len(train_data)} items")
     print(f"Raw dev data length: {len(dev_data)} items")
     print(f"Raw test data length: {len(test_data)} items")
+    if write_textgrid:
+        print(f"TextGrid: enabled -> {textgrid_dir} (derived by replacing the {audio_root} prefix in audio paths)")
     
     dev_output_file = config['data']['valid_data']
     test_output_file = config['data']['test_data']
@@ -222,13 +277,16 @@ def main(config_path, device="cuda" if torch.cuda.is_available() else "cpu"):
         os.makedirs(os.path.dirname(ofile), exist_ok=True)
     
     print("\n=== Processing Development Set ===")
-    process_dataset_multiprocess(dev_data, config, dev_output_file, "dev", device)
+    process_dataset_multiprocess(dev_data, config, dev_output_file, "dev", device,
+                                 write_textgrid, textgrid_dir, audio_root)
 
     print("\n=== Processing Test Set ===")
-    process_dataset_multiprocess(test_data, config, test_output_file, "test", device)
+    process_dataset_multiprocess(test_data, config, test_output_file, "test", device,
+                                 write_textgrid, textgrid_dir, audio_root)
 
     print("\n=== Processing Training Set ===")
-    process_dataset_multiprocess(train_data, config, train_output_file, "train", device)
+    process_dataset_multiprocess(train_data, config, train_output_file, "train", device,
+                                 write_textgrid, textgrid_dir, audio_root)
     
     print("\nAll processing completed!")
     print(f"Training set saved to: {train_output_file}")
@@ -238,4 +296,5 @@ def main(config_path, device="cuda" if torch.cuda.is_available() else "cpu"):
 if __name__ == "__main__":
 
     args = parse_args()
-    main(args.config, device=args.device)
+    main(args.config, device=args.device, write_textgrid=args.write_textgrid,
+         textgrid_dir=args.textgrid_dir, audio_root=args.audio_root)

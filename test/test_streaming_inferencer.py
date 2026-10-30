@@ -28,6 +28,11 @@ def is_cross_history_metric_enabled(task_type: str, cfg: Dict) -> bool:
     return task_type == "cross" and not bool(cfg.get("model", {}).get("length_aligned_input", False))
 
 
+def is_speaker_similarity_enabled(task_type: str) -> bool:
+    """The single-speaker task has no reference speaker audio, so speaker similarity is not computed."""
+    return task_type in {"continuation", "cross"}
+
+
 
 def load_config(config_path: str) -> Dict:
     with open(config_path, "r", encoding="utf-8") as f:
@@ -115,7 +120,7 @@ def resolve_prompt_speech_path(item: Dict) -> str:
 def build_sample(task_type: str, item: Dict, index: int) -> Dict:
     sample_id = str(item.get("id", index)).strip() or str(index)
     if task_type == "single-speaker":
-        synth_text = item.get("units_label")
+        synth_text = item.get("units_label") or item.get("text")
         reference_text = item.get("text") or synth_text
         return {
             "id": sample_id,
@@ -369,6 +374,8 @@ def run_task(
     cross_history_token_counts: List[float] = []
     cross_history_update_times: List[float] = []
     track_cross_history_metrics = is_cross_history_metric_enabled(task_type, cfg)
+    track_speaker_similarity = is_speaker_similarity_enabled(task_type)
+    task_speaker_extractor = speaker_extractor if track_speaker_similarity else None
 
     for index, item in enumerate(task_data, start=1):
         if should_skip_item(task_type, item):
@@ -411,7 +418,7 @@ def run_task(
                 sample["reference_text"],
                 sample["prompt_speech_path"],
                 result["ctctts_speech_path"],
-                speaker_extractor,
+                task_speaker_extractor,
                 asr_model,
                 wer_metric,
                 cer_metric,
@@ -474,7 +481,7 @@ def run_task(
         "avg_generation_time_ms": safe_mean(generation_times),
         "avg_rtf": safe_mean(rtfs),
         "avg_utmos": safe_mean(utmos_values),
-        "avg_speaker_similarity": safe_mean(speaker_sims),
+        "avg_speaker_similarity": safe_mean(speaker_sims) if track_speaker_similarity else float("nan"),
         "avg_wer": safe_mean(wers),
         "avg_cer": safe_mean(cers),
         "avg_cross_first_chunk_history_text_token_count": safe_mean(cross_history_token_counts),
@@ -486,10 +493,11 @@ def run_task(
         f"avg_generation_time={summary['avg_generation_time_ms']:.4f} ms, "
         f"avg_rtf={summary['avg_rtf']:.6f}, "
         f"avg_utmos={summary['avg_utmos']:.4f}, "
-        f"avg_speaker_similarity={summary['avg_speaker_similarity']:.4f}, "
         f"avg_wer={summary['avg_wer']:.6f}, "
         f"avg_cer={summary['avg_cer']:.6f}"
     )
+    if track_speaker_similarity:
+        summary_message += f", avg_speaker_similarity={summary['avg_speaker_similarity']:.4f}"
     if track_cross_history_metrics:
         summary_message += (
             f", avg_cross_history_text_tokens={summary['avg_cross_first_chunk_history_text_token_count']:.4f}, "
@@ -517,7 +525,7 @@ def main(config_path: str):
     asr_model = load_asr_model(asr_model_path, asr_model_type)
 
     requested_tasks = get_requested_tasks(cfg)
-    use_speaker_similarity = any(task in {"continuation", "cross"} for task in requested_tasks)
+    use_speaker_similarity = any(is_speaker_similarity_enabled(task) for task in requested_tasks)
     speaker_extractor = None
     if use_speaker_similarity:
         wavlm_path = inf_cfg.get("wavlm_path")
@@ -545,17 +553,21 @@ def main(config_path: str):
             f"avg_generation_time={summary['avg_generation_time_ms']:.4f} ms, "
             f"avg_rtf={summary['avg_rtf']:.6f}, "
             f"avg_utmos={summary['avg_utmos']:.4f}, "
-            f"avg_speaker_similarity={summary['avg_speaker_similarity']:.4f}, "
             f"avg_wer={summary['avg_wer']:.6f}, "
             f"avg_cer={summary['avg_cer']:.6f}, "
             f"result_json={summary['result_json']}"
         )
+        if is_speaker_similarity_enabled(summary["task_type"]):
+            final_message += f", avg_speaker_similarity={summary['avg_speaker_similarity']:.4f}"
         if is_cross_history_metric_enabled(summary["task_type"], cfg):
             final_message += (
                 f", avg_cross_history_text_tokens={summary['avg_cross_first_chunk_history_text_token_count']:.4f}, "
                 f"avg_cross_history_update_time_ms={summary['avg_cross_first_chunk_history_text_update_time_ms']:.4f}"
             )
         print(final_message)
+
+    # Worker processes are reused across samples; explicitly shut them down here
+    si.shutdown_workers()
 
 
 if __name__ == "__main__":
